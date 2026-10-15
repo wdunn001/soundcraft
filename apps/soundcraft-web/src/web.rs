@@ -1,5 +1,7 @@
 //! The browser shell: the eframe web runner around [`SoundApp`].
 
+mod cloud;
+
 use serde_json::json;
 use soundcraft_engine::{Engine, io};
 use soundcraft_ui_egui::dialogs::Dialog;
@@ -40,7 +42,15 @@ pub fn start() {
                     }
                     let engine = if query().contains("empty") { Engine::default() } else { soundcraft_engine::demo::demo_engine() };
                     let player = soundcraft_playback::Player::new(Arc::new(engine.session().clone()));
-                    let app = SoundApp::new(engine, Some(player), Services::default());
+                    let mut app = SoundApp::new(engine, Some(player), Services::default());
+                    // Cloud Open / Save / Share / account: same-origin cookie transport.
+                    // The service URL comes from the page, not the binary. Without CollabCraft
+                    // serving this page the backend connects but every call returns Unauthenticated,
+                    // which the login redirect above handles.
+                    let backend = cloud::Service::new(cc.egui_ctx.clone());
+                    app.cloud.connect(backend);
+                    app.share.connect(collabcraft_share::CollabCraft::from_fn(|| Some(craft_cloud_client::Client::from_page())));
+                    soundcraft_ui_egui::cloud::start(&mut app);
                     Ok(Box::new(WebShell { app, inbox: Rc::default() }))
                 }),
             )
