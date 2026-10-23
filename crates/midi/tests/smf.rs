@@ -149,6 +149,29 @@ fn division_conversion_96_and_smpte() {
 }
 
 #[test]
+fn smpte_division_rejects_undefined_frame_rates() {
+    let body = vec![0, 0x90, 60, 100, 40, 0x80, 60, 64, 0, 0xFF, 0x2F, 0];
+    for high in 0x80..=0xFF {
+        if [(-24i8) as u8, (-25i8) as u8, (-29i8) as u8, (-30i8) as u8].contains(&high) {
+            continue;
+        }
+        let division = u16::from_be_bytes([high, 40]);
+        assert!(matches!(read_smf(&file(0, division, std::slice::from_ref(&body))), Err(MidiError::Invalid { offset: 12, .. })), "{division:#06x}");
+    }
+}
+
+#[test]
+fn smpte_division_keeps_all_four_standard_frame_rates() {
+    for (fps, file_ticks, model_ticks) in [(24i8, 960, 1920), (25, 1000, 1920), (29, 1200, 1922), (30, 1200, 1920)] {
+        let body = [vec![0, 0x90, 60, 100], vlq(file_ticks), vec![0x80, 60, 64, 0, 0xFF, 0x2F, 0]].concat();
+        let division = u16::from_be_bytes([(-fps) as u8, 40]);
+        let smf = read_smf(&file(0, division, std::slice::from_ref(&body))).unwrap();
+        assert_eq!(smf.tracks[0].sequence.notes, vec![note(60, 0, model_ticks)], "{fps} fps");
+        assert!(read_smf(&file(0, u16::from_be_bytes([(-fps) as u8, 0]), std::slice::from_ref(&body))).is_err());
+    }
+}
+
+#[test]
 fn running_status_and_velocity_zero_note_off() {
     // Note-on with running status for both on and off (velocity 0).
     let body = [
@@ -330,5 +353,23 @@ proptest! {
         a.sort();
         b.sort();
         prop_assert_eq!(a, b);
+    }
+}
+
+/// #472: out-of-range pitches, release velocities and controller numbers clamp to 127 instead of
+/// wrapping into other notes and controllers (128 & 0x7F would be 0).
+#[test]
+fn writer_clamps_out_of_range_data_bytes() {
+    for raw in [127u8, 128, 255] {
+        let mut seq = Sequence::default();
+        seq.notes.push(Note { pitch: raw, velocity: 100, release_velocity: raw, channel: 0, start: 0, length: 960 });
+        seq.ctrls.push(CtrlEvent { tick: 0, channel: 0, kind: CtrlKind::Cc(raw), value: 64 });
+        seq.ctrls.push(CtrlEvent { tick: 0, channel: 0, kind: CtrlKind::PolyPressure(raw), value: 64 });
+        let smf = Smf { tracks: vec![SmfTrack { name: String::new(), sequence: seq }], ..Smf::default() };
+        let back = read_smf(&write_smf(&smf).unwrap()).unwrap();
+        let s = &back.tracks.last().unwrap().sequence;
+        assert_eq!((s.notes[0].pitch, s.notes[0].release_velocity), (127, 127), "input {raw}");
+        let kinds: Vec<CtrlKind> = s.ctrls.iter().map(|c| c.kind).collect();
+        assert!(kinds.contains(&CtrlKind::Cc(127)) && kinds.contains(&CtrlKind::PolyPressure(127)), "input {raw}: {kinds:?}");
     }
 }

@@ -11,6 +11,7 @@
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod cloud;
 mod config;
 mod control_server;
 #[cfg(any(target_os = "windows", test))]
@@ -44,14 +45,15 @@ impl eframe::App for App {
         if let Some(menu) = &mut self.2 {
             menu.process(&mut self.0);
         }
-        self.0.logic(ctx);
+        self.0.guarded(|app| app.logic(ctx));
         #[cfg(target_os = "macos")]
         if let Some(menu) = &mut self.2 {
             menu.sync(&self.0);
         }
-        // Files dropped on the window: sessions open, audio/MIDI import.
+        // Files dropped on the window: audio on an instrument track or a Sampler window loads
+        // the sampler; otherwise sessions open and audio/MIDI import.
         let dropped: Vec<String> =
-            ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_string_lossy().into_owned()).filter(|s| !s.is_empty()).collect());
+            self.0.take_dropped_files(ctx).iter().map(|f| f.path().to_string_lossy().into_owned()).filter(|s| !s.is_empty()).collect();
         for p in dropped {
             open_path(&mut self.0, &p);
         }
@@ -67,6 +69,10 @@ impl eframe::App for App {
             self.0.ui.window_size = (r.size() * ctx.zoom_factor()).round().into();
         }
         self.0.ui.ui_scale = self.0.extra.ui_scale;
+        // Saved now rather than at exit: the recent list matters most after a crash.
+        if self.0.take_recent_changed() {
+            save_prefs(&self.0.ui);
+        }
         // With the system menu bar there is no egui bar showing the window and dirty state, so the
         // title carries them; elsewhere the egui menu bar already does.
         let title = if self.0.native_menu_bar {
@@ -85,9 +91,10 @@ impl eframe::App for App {
         self.0.raw_input_hook(raw);
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.0.ui(ui);
+        self.0.guarded(|app| app.ui(ui));
     }
     fn on_exit(&mut self) {
+        self.0.close_autosave();
         save_prefs(&self.0.ui);
         if let Some(logger) = self.1 {
             logger.report_audio_thread();
@@ -155,6 +162,19 @@ fn save_prefs(ui: &UiState) {
 
 fn services() -> Services {
     Services {
+        open_url: Some(Box::new(|url: &str| {
+            // Same quoting trick as cloud::open_browser: percent-encode `"` so
+            // it cannot break the cmd.exe quoted argument on Windows.
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt as _;
+                let _ = std::process::Command::new("cmd").raw_arg(format!("/C start \"\" \"{}\"", url.replace('"', "%22"))).spawn();
+            }
+            #[cfg(target_os = "macos")]
+            let _ = std::process::Command::new("open").arg(url).spawn();
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+            let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+        })),
         pick_open: Some(Box::new(|purpose: &str, _exts: &[&str]| {
             let d = rfd::FileDialog::new();
             let d = match purpose {
@@ -162,14 +182,20 @@ fn services() -> Services {
                 "file.import_midi" => d.add_filter("MIDI", &["mid", "midi", "smf"]),
                 _ => d.add_filter(
                     "Audio",
-                    &["wav", "wave", "bwf", "aif", "aiff", "aifc", "flac", "mp3", "ogg", "oga", "m4a", "aac", "mp4", "caf", "mkv", "webm"],
+                    &["wav", "wave", "bwf", "aif", "aiff", "aifc", "flac", "mp3", "ogg", "oga", "m4a", "m4b", "aac", "mp4", "caf", "mkv", "webm"],
                 ),
             };
             d.pick_file().map(|p| p.to_string_lossy().into_owned())
         })),
-        pick_save: Some(Box::new(|_purpose: &str, default: &str| {
+        pick_save: Some(Box::new(|purpose: &str, default: &str| {
             let path = std::path::Path::new(default);
-            let mut d = rfd::FileDialog::new().add_filter("SoundCraft Session", &["scraft"]);
+            let mut d = match purpose {
+                "file.bounce_mix" => rfd::FileDialog::new().add_filter("Audio", &["wav", "aif", "aiff", "flac"]),
+                _ => rfd::FileDialog::new().add_filter("SoundCraft Session", &["scraft"]),
+            };
+            if let Some(dir) = path.parent().filter(|dir| dir.is_dir()) {
+                d = d.set_directory(dir);
+            }
             if let Some(n) = path.file_name().and_then(|n| n.to_str()) {
                 d = d.set_file_name(n);
             }
@@ -255,12 +281,24 @@ fn main() -> eframe::Result {
         "SoundCraft",
         options,
         Box::new(move |cc| {
-            let player = if no_audio { None } else { Some(soundcraft_playback::Player::new(Arc::new(engine.session().clone()))) };
+            let player =
+                if no_audio { None } else { Some(soundcraft_playback::Player::with_config(Arc::new(engine.session().clone()), &prefs.audio)) };
             let mut app = SoundApp::new(engine, player, services());
             app.autosave_dir = prefs_path().and_then(|p| p.parent().map(|d| d.join("Autosave")));
+            app.leftovers = app.autosave_dir.as_deref().map(soundcraft_engine::autosave::leftovers).unwrap_or_default();
             app.preset_dir = prefs_path().and_then(|p| p.parent().map(|d| d.join("Presets")));
             app.extra.ui_scale = prefs.ui_scale;
             app.ui = prefs;
+            // Cloud Open / Save / Share / account / presence. The worker blocks,
+            // so every call runs on its own thread. Without a service configured
+            // nothing cloud-shaped is offered in the interface.
+            if let Some(backend) = cloud::service(cc.egui_ctx.clone()) {
+                app.cloud.connect(backend);
+                if cloud::has_saved_token() {
+                    soundcraft_ui_egui::cloud::start(&mut app);
+                }
+            }
+            app.share.connect(collabcraft_share::CollabCraft::from_fn(cloud::client));
             if let Some(port) = control_port {
                 let rx = control_server::start(port, cc.egui_ctx.clone());
                 app = app.with_control(rx);

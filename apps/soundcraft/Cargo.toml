@@ -10,10 +10,18 @@ default-run = "soundcraft"
 [lints]
 workspace = true
 
+[features]
+# ASIO audio devices on Windows (see soundcraft-playback's `asio` feature).
+asio = ["soundcraft-playback/asio"]
+
 [dependencies]
 soundcraft-engine.workspace = true
 soundcraft-ui-egui.workspace = true
 soundcraft-playback.workspace = true
+# Cloud storage transport: the blocking CollabCraft client that the desktop
+# worker thread uses.  No provider credential or provider URL lives here.
+craft-cloud-client.workspace = true
+collabcraft-share.workspace = true
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11", "links"] }
 egui.workspace = true
 serde_json.workspace = true
@@ -27,6 +35,6 @@ rfd.workspace = true
 winresource = "0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-muda = { version = "0.19.2", default-features = false }
+muda = { version = "0.21.2", default-features = false }
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSResponder"] }
