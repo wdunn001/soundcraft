@@ -52,7 +52,7 @@ pub use craft_ui::cloud::{
     start, who, work_together,
 };
 use egui::{Color32, Painter, Rect, Ui};
-use serde_json::Value as Json;
+use serde_json::{Value as Json, json};
 use soundcraft_engine::io::{BUNDLE_EXTENSION, open_session_bytes, session_bundle};
 use soundcraft_model::Session;
 
@@ -309,6 +309,18 @@ impl CloudApp for SoundApp {
              by the service."
                 .to_owned(),
         )
+    }
+
+    fn recents(&self) -> Vec<String> {
+        self.ui.recent_sessions.clone()
+    }
+
+    fn open_recent(&mut self, path: &str) {
+        let _ = self.run("file.open", json!({"path": path}));
+    }
+
+    fn browse_local(&mut self) {
+        let _ = self.run("file.open", json!({}));
     }
 
     fn style(&self, _ui: &Ui) -> craft_ui::cloud::CloudStyle {
